@@ -27,11 +27,15 @@ VIDEOCHATGPT = {
 }
 
 data_dict = {
-    "cambrian_737k": CAMBRIAN_737K,
-    "cambrian_737k_pack": CAMBRIAN_737K_PACK,
-    "mp_doc": MP_DOC,
-    "clevr_mc": CLEVR_MC,
-    "videochatgpt": VIDEOCHATGPT,
+    # "cambrian_737k": CAMBRIAN_737K,
+    # "cambrian_737k_pack": CAMBRIAN_737K_PACK,
+    # "mp_doc": MP_DOC,
+    # "clevr_mc": CLEVR_MC,
+    # "videochatgpt": VIDEOCHATGPT,
+    "watermarks": {
+        "annotation_path": "/mnt/storage/Downloads/WatermarkDatasetSampled/annotations.json",
+        "data_path": "/mnt/storage/Downloads/WatermarkDatasetSampled",
+    },
 }
 
 
@@ -57,7 +61,7 @@ def data_list(dataset_names):
 
 
 if __name__ == "__main__":
-    dataset_names = ["cambrian_737k"]
+    dataset_names = ["watermarks"]
     configs = data_list(dataset_names)
     for config in configs:
         print(config)

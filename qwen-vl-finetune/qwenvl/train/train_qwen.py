@@ -25,7 +25,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
-from trainer import replace_qwen2_vl_attention_class
+# from trainer import replace_qwen2_vl_attention_class
 
 from transformers import (
     Qwen2VLForConditionalGeneration,
@@ -89,7 +89,7 @@ def set_model(model_args, model):
         model.lm_head.requires_grad = False
 
 
-def train(attn_implementation="flash_attention_2"):
+def train(attn_implementation="sdpa"):
     global local_rank
 
     parser = transformers.HfArgumentParser(
@@ -138,8 +138,8 @@ def train(attn_implementation="flash_attention_2"):
         model_args.model_name_or_path,
     )
 
-    if data_args.data_flatten or data_args.data_packing:
-        replace_qwen2_vl_attention_class()
+    # if data_args.data_flatten or data_args.data_packing:
+    #     replace_qwen2_vl_attention_class()
     model.config.use_cache = False
 
     if training_args.gradient_checkpointing:
@@ -203,4 +203,4 @@ def train(attn_implementation="flash_attention_2"):
 
 
 if __name__ == "__main__":
-    train(attn_implementation="flash_attention_2")
+    train(attn_implementation="sdpa")
