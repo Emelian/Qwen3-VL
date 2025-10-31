@@ -38,7 +38,6 @@ from PIL import Image, UnidentifiedImageError
 from tqdm.auto import tqdm
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
-MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 
 STYLES = [
@@ -71,6 +70,8 @@ TEXT_PROMPT = (
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate predictions with Qwen2.5-VL into <root>/predictions.json")
     p.add_argument("--root", type=Path, required=True, help="Images root (scanned recursively)")
+    # p.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct", help="HF model id")
+    p.add_argument("--model-id", type=str, default="output", help="HF model id")
     p.add_argument("--device", type=str, default="cuda", help="Device: 'cuda', 'cuda:0' or 'cpu'")
     p.add_argument("--save-every", type=int, default=10, help="Save JSON every N predictions (0 disables)")
     p.add_argument("--max-new-tokens", type=int, default=256, help="Max new tokens for generation")
@@ -115,13 +116,13 @@ class QwenPredictor:
 
     WORD_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)?")
 
-    def __init__(self, device: str, max_new_tokens: int, temperature: float):
+    def __init__(self, model_id: str, device: str, max_new_tokens: int, temperature: float):
         self.device = device
         self.max_new_tokens = int(max_new_tokens)
         self.temperature = float(temperature)
-        self.processor = AutoProcessor.from_pretrained(MODEL_ID)
+        self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            MODEL_ID,
+            model_id,
             torch_dtype=self._select_dtype(device),
         ).to(device)
         self.model.eval()
@@ -242,7 +243,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     root = args.root.resolve()
     out_path = root / "predictions.json"
     rel_images = scan_images(root)
-    predictor = QwenPredictor(args.device, args.max_new_tokens, args.temperature)
+    predictor = QwenPredictor(args.model_id, args.device, args.max_new_tokens, args.temperature)
 
     items: List[Dict[str, Any]] = []
     since_save = 0
