@@ -33,7 +33,7 @@ data_dict = {
     # "clevr_mc": CLEVR_MC,
     # "videochatgpt": VIDEOCHATGPT,
     "watermarks": {
-        "annotation_path": "/mnt/storage/Downloads/WatermarkDatasetSampled/annotations.json",
+        "annotation_path": "/mnt/storage/Downloads/WatermarkDatasetSampled/predictions.json",
         "data_path": "/mnt/storage/Downloads/WatermarkDatasetSampled",
     },
 }

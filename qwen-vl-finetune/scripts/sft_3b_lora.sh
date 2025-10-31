@@ -7,13 +7,13 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 NNODES=${WORLD_SIZE:-1}
 
 # DeepSpeed configuration
-deepspeed=./qwen-vl-finetune/scripts/zero2.json
+deepspeed=./qwen-vl-finetune/scripts/zero3.json
 
 # Model configuration
 llm=Qwen/Qwen2.5-VL-3B-Instruct  # Using HuggingFace model ID
 
 # Training hyperparameters
-lr=2e-7
+lr=2e-6
 batch_size=4
 grad_accum_steps=4
 
@@ -33,7 +33,7 @@ args="
     --model_name_or_path "${llm}" \
     --dataset_use ${datasets} \
     --tune_mm_vision False \
-    --tune_mm_mlp False \
+    --tune_mm_mlp True \
     --tune_mm_llm True \
     --bf16 \
     --output_dir ${output_dir} \
@@ -45,7 +45,7 @@ args="
     --min_pixels 784 \
     --eval_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 500 \
+    --save_steps 505 \
     --save_total_limit 3 \
     --learning_rate ${lr} \
     --mm_projector_lr 1e-5 \
