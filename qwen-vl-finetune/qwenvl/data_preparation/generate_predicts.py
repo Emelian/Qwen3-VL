@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Generate Qwen2.5-VL predictions for an image directory."""
+"""Generate Qwen2.5-VL predictions for an image directory.
+
+Changes vs previous version:
+- "text" field is now a **list of words present on the image**, not a JSON string duplicating other fields.
+- Added TEXT_PROMPT and robust parsing/normalization utilities.
+- Validation updated to require list[str] for "text".
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import regex as re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -18,21 +25,31 @@ from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
-MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 
 WATERMARK_PROMPT = (
-    "You are a JSON generator. Count visible watermarks (logos or text overlays). "
-    "Ignore natural scene text. Return JSON: {\"watermarks\": <integer>}"
+    "You are a dict generator. Count visible watermarks (logos or text overlays). "
+    "Ignore natural scene text. Return dict: {\"watermarks\": <integer>}. "
+    "Strictly {\"watermarks\": <integer>} format without any special symbols."
 )
 MAIN_OBJECT_PROMPT = (
-    "You are a JSON generator. Name the single main object (1–3 lowercase words). "
-    "Return JSON: {\"main object\": <string>}"
+    "You are a dict generator. Name the single main object (1–3 lowercase words). "
+    "Return dict: {\"main object\": \"<string>\"}. "
+    "Strictly {\"main object\": \"<string>\"} format without any special symbols."
 )
 STYLE_PROMPT_TEMPLATE = (
-    "You are a JSON generator. Classify visual style. "
+    "You are a dict generator. Classify visual style. "
     "Choose strictly one from this list: {choices}. "
-    "Return JSON: {\"style\": <string>}"
+    "Return dict: {{\"style\": \"<string>\"}}. "
+    "Strictly {{\"style\": \"<string>\"}} format without any special symbols."
+)
+TEXT_PROMPT = (
+    "You are a dict generator. Read all CLEARLY READABLE WORDS in the image. "
+    "Normalize to lowercase ASCII where possible, strip punctuation except hyphens within words. "
+    "Return dict: {\"text\": [\"word1\", \"word2\", ...]}. "
+    "If text doesn't exists on image return dict: {\"text\": []}."
+    "Strict JSON only with the exact key 'text'."
 )
 
 
@@ -224,12 +241,10 @@ class Predictor:
                 generated = self.model.generate(**tensor_inputs, **generation_kwargs)
 
         new_tokens = generated[:, input_length:]
-        decoded = self.processor.batch_decode(
-            new_tokens, skip_special_tokens=True
-        )[0]
-        return decoded.strip()
+        decoded = self.processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
+        return decoded.strip().replace("`", "")
 
-    def _parse_json(self, text: str, key: str) -> Any:
+    def _parse_json_key(self, text: str, key: str) -> Any:
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -238,6 +253,53 @@ class Predictor:
             raise ValueError(f"JSON response missing '{key}': {text}")
         return parsed[key]
 
+    # --- New helpers for text list parsing ---
+    WORD_RE = re.compile(r"[\p{L}\p{N}]+(?:-[\p{L}\p{N}]+)?", re.UNICODE)
+
+    def _normalize_words(self, words: Iterable[str]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for w in words:
+            if not isinstance(w, str):
+                w = str(w)
+            w = w.strip().lower()
+            # Strip leading/trailing punctuation but keep internal hyphens
+            w = re.sub(r"^[\W_]+|[\W_]+$", "", w)
+            if not w:
+                continue
+            if w not in seen:
+                seen.add(w)
+                out.append(w)
+        return out
+
+    def _parse_text_list(self, text: str) -> List[str]:
+        """Parse model output into a list[str] robustly.
+        Preferred: {"text": ["..."]}
+        Fallbacks: raw list JSON, or a string with words.
+        """
+        # Try strict dict with key
+        try:
+            maybe = json.loads(text)
+            if isinstance(maybe, dict) and "text" in maybe:
+                value = maybe["text"]
+                if isinstance(value, list):
+                    return self._normalize_words(value)
+                if isinstance(value, str):
+                    # extract words from string
+                    return self._normalize_words(self.WORD_RE.findall(value))
+        except json.JSONDecodeError:
+            pass
+        # Try raw JSON list
+        try:
+            maybe_list = json.loads(text)
+            if isinstance(maybe_list, list):
+                return self._normalize_words(maybe_list)
+        except json.JSONDecodeError:
+            pass
+        # Last resort: regex over raw text
+        return self._normalize_words(self.WORD_RE.findall(text))
+
+    # --- Prediction ---
     def predict(self, image_path: Path) -> Dict[str, Any]:
         image = open_image(image_path)
 
@@ -246,8 +308,9 @@ class Predictor:
         choices_text = "{" + ", ".join(self.cfg.styles) + "}"
         style_prompt = STYLE_PROMPT_TEMPLATE.format(choices=choices_text)
         style_raw = self._run_prompt(image, style_prompt)
+        text_raw = self._run_prompt(image, TEXT_PROMPT)
 
-        watermarks = self._parse_json(watermarks_raw, "watermarks")
+        watermarks = self._parse_json_key(watermarks_raw, "watermarks")
         if isinstance(watermarks, str) and watermarks.isdigit():
             watermarks = int(watermarks)
         if not isinstance(watermarks, int):
@@ -258,12 +321,12 @@ class Predictor:
                     f"Watermarks value must be an integer: {watermarks_raw}"
                 ) from exc
 
-        main_object = self._parse_json(main_object_raw, "main object")
+        main_object = self._parse_json_key(main_object_raw, "main object")
         if not isinstance(main_object, str):
             main_object = str(main_object)
         main_object = main_object.strip()
 
-        style = self._parse_json(style_raw, "style")
+        style = self._parse_json_key(style_raw, "style")
         if not isinstance(style, str):
             style = str(style)
         style = style.strip()
@@ -272,18 +335,11 @@ class Predictor:
                 f"Predicted style '{style}' is not in configured styles list."
             )
 
-        combined_text = json.dumps(
-            {
-                "watermarks": watermarks,
-                "main object": main_object,
-                "style": style,
-            },
-            ensure_ascii=False,
-        )
+        words = self._parse_text_list(text_raw)
 
         return {
             "watermarks": watermarks,
-            "text": combined_text,
+            "text": words,  # <- list[str]
             "main object": main_object,
             "style": style,
         }
@@ -293,6 +349,10 @@ def is_complete(entry: Any) -> bool:
     if not isinstance(entry, dict):
         return False
     if not isinstance(entry.get("watermarks"), int):
+        return False
+    # text must be list[str] (can be empty list)
+    text_val = entry.get("text")
+    if not isinstance(text_val, list) or not all(isinstance(x, str) for x in text_val):
         return False
     if not isinstance(entry.get("main object"), str):
         return False
@@ -344,13 +404,13 @@ def parse_args(args: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=str,
-        required=True,
+        default="qwen-vl-finetune/qwenvl/generate_predicts.yaml",
         help="Path to YAML configuration file",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default=None,
+        default="cuda",
         help="Override device (e.g. cuda, cuda:0, cpu)",
     )
     return parser.parse_args(args)

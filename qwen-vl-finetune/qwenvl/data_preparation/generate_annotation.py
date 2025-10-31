@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Utility for generating pre-annotations for image datasets.
 
+Changes vs previous version:
+- OCR now uses Florence-2 (<OCR>) and returns a list of normalized words.
+- Main object scoring improved: objectness * area_norm * center_prior.
+- If no detections/captions, fallback: Florence-2 <CAPTION> with "one word" constraint.
+
 The script performs three independent passes over a dataset of images:
+1) OCR with Florence-2 <OCR>.
+2) Region proposal + dense captions with Florence-2 to pick a main object.
+3) Style classification with CLIP using prompt ensembling.
 
-1. OCR using a TrOCR model to extract normalized token lists.
-2. Region proposal and dense captioning with Florence-2 to identify the
-   main object per image.
-3. Style classification with CLIP using prompt ensembling.
-
-Results are stored as JSON dictionaries in the configured output
-directory. Each stage skips images that already have annotations and
-performs incremental saves to avoid large progress loss on failures.
-
-All heavyweight models are loaded once per stage, used, and explicitly
-released to free GPU memory.
+Outputs:
+- texts.json: { rel_path: [word, ...] }
+- main_objects.json: { rel_path: "<string>" }
+- styles.json: { rel_path: "<style>" }
 """
 
 from __future__ import annotations
@@ -39,22 +40,18 @@ import yaml
 from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoProcessor,
     CLIPModel,
     CLIPProcessor,
-    TrOCRProcessor,
-    VisionEncoderDecoderModel,
 )
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 DEFAULT_CLIP_TEMPLATES = (
-    "a {style} style image",
-    "an image in the style of {style}",
-    "a {style} artwork",
-    "a piece of art in the {style} style",
-    "a photograph with {style} aesthetics",
+    "a {style} image",
+    "image in the style of {style}",
 )
 
 
@@ -65,7 +62,6 @@ class Config:
     device: str
     batch_size_clip: int
     save_every: int
-    ocr_model_id: str
     florence_model_id: str
     clip_model_id: str
     clip_styles: Sequence[str]
@@ -96,7 +92,6 @@ def load_config(config_path: Path, override_device: Optional[str]) -> Config:
         device=device,
         batch_size_clip=int(raw_cfg.get("batch_size_clip", 4)),
         save_every=int(raw_cfg.get("save_every", 20)),
-        ocr_model_id=raw_cfg.get("ocr_model_id", "microsoft/trocr-large-printed"),
         florence_model_id=raw_cfg.get("florence_model_id", "microsoft/Florence-2-base"),
         clip_model_id=raw_cfg.get("clip_model_id", "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"),
         clip_styles=clip_styles,
@@ -218,40 +213,127 @@ def cleanup_torch(device: str) -> None:
         torch.cuda.empty_cache()
 
 
-def perform_ocr(
+def strip_loc_tokens(text: str) -> str:
+    """Удалить все <loc_###> из строки."""
+    return re.sub(r"<loc_\d+>", "", text).strip()
+
+
+def first_word(text: str) -> str:
+    m = re.search(r"[A-Za-z0-9]+", text)
+    return m.group(0).lower() if m else (text.strip().split()[0] if text.strip() else "")
+
+
+def parse_florence_dense_pairs(raw: str) -> List[RegionCaption]:
+    """
+    Парсит последовательность вида:
+      caption <loc_i><loc_j><loc_k><loc_l> caption2 <loc_...> ...
+    Возвращает список RegionCaption(caption, bbox_norm[0..1]).
+    """
+    res: List[RegionCaption] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        # 1) набираем текст до первого <loc_...>
+        m = re.search(r"<loc_(\d+)>", raw[i:])
+        if not m:
+            break
+        start_loc = i + m.start()
+        caption = raw[i:start_loc].strip()
+        # 2) читаем 4 loc подряд
+        locs = re.findall(r"<loc_(\d+)>", raw[start_loc:start_loc+200])  # локально
+        if len(locs) < 4:
+            break
+        x1, y1, x2, y2 = [int(t) / 999.0 for t in locs[:4]]
+        # 3) сдвигаем указатель за эти 4 loc-токена
+        advance = 0
+        cnt = 0
+        for m2 in re.finditer(r"<loc_(\d+)>", raw[start_loc:]):
+            advance = m2.end()
+            cnt += 1
+            if cnt == 4:
+                break
+        i = start_loc + advance
+        # 4) приводим капшен в чистый вид и добавляем
+        clean_caption = caption.strip(" .,:;|-").strip()
+        if clean_caption:
+            res.append(RegionCaption(bbox=(x1, y1, x2, y2), caption=clean_caption))
+    return res
+
+
+# -----------------------------
+# Florence-2 helpers
+# -----------------------------
+class Florence:
+    def __init__(self, model_id: str, device: str, max_new_tokens: int, use_fp16: bool, use_bf16: bool):
+        self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        # robust eager attn for compatibility
+        setattr(config, "attn_implementation", "eager")
+        setattr(config, "_attn_implementation", "eager")
+        setattr(config, "use_cache", "False")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            config=config,
+            attn_implementation="eager",
+        )
+        self.model.to(device)
+        self.model.eval()
+        self.device = device
+        self.max_new_tokens = max_new_tokens
+        self.use_fp16 = use_fp16
+        self.use_bf16 = use_bf16
+
+    def generate(self, image: Image.Image, prompt: str) -> str:
+        inputs = self.processor(text=prompt, images=image, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            with torch_autocast(self.device, self.use_fp16, self.use_bf16):
+                out_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    use_cache=False,
+                    return_dict_in_generate=False,
+                )
+        text = self.processor.batch_decode(out_ids, skip_special_tokens=True)[0]
+        text = text.replace(prompt, "").strip()
+        text = re.sub(r"\s+", " ", text)
+        return text
+
+    def close(self):
+        del self.model
+        del self.processor
+
+
+# -----------------------------
+# OCR with Florence-2 (<OCR>)
+# -----------------------------
+def perform_ocr_florence(
     cfg: Config,
     logger: logging.Logger,
     rel_paths: Sequence[str],
     texts_path: Path,
     existing: Dict[str, Any],
 ) -> Dict[str, Any]:
-    processor = TrOCRProcessor.from_pretrained(cfg.ocr_model_id)
-    model = VisionEncoderDecoderModel.from_pretrained(cfg.ocr_model_id)
-    model.to(cfg.device)
-    model.eval()
+    fl = Florence(cfg.florence_model_id, cfg.device, cfg.florence_max_new_tokens, cfg.use_fp16, cfg.use_bf16)
 
     results = dict(existing)
     since_save = 0
     timeout = cfg.timeout_per_image_seconds
 
-    for rel_path in tqdm(rel_paths, desc="OCR", unit="img"):
+    for rel_path in tqdm(rel_paths, desc="OCR (Florence-2)", unit="img"):
         if rel_path in results:
             continue
         abs_path = cfg.image_root / rel_path
 
         def _process_image() -> List[str]:
             image = open_image_rgb(abs_path)
-            pixel_values = processor(image, return_tensors="pt").pixel_values
-            pixel_values = pixel_values.to(cfg.device)
-            with torch.no_grad():
-                with torch_autocast(cfg.device, cfg.use_fp16, cfg.use_bf16):
-                    generated_ids = model.generate(pixel_values)
-            text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            return normalize_text(text)
+            raw = fl.generate(image, "<OCR>")
+            # Florence часто возвращает текст без спец-токенов — просто нормализуем
+            return normalize_text(raw)
 
         try:
             words = run_with_timeout(_process_image, timeout)
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception as exc:  # noqa: BLE001
             log_exception(logger, rel_path, exc)
             continue
 
@@ -262,16 +344,18 @@ def perform_ocr(
             since_save = 0
 
     save_json(texts_path, results)
-    del model
-    del processor
+    fl.close()
     cleanup_torch(cfg.device)
     return results
 
 
+# -----------------------------
+# Florence-2 main object
+# -----------------------------
 @dataclass
 class RegionCandidate:
-    bbox: Tuple[float, float, float, float]
-    score: float
+    bbox: Tuple[float, float, float, float]  # absolute or normalized
+    score: float  # objectness if present, else 1.0
 
 
 @dataclass
@@ -307,69 +391,9 @@ def _load_json_lenient(text: str) -> Any:
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
-        # fall back to literal eval after normalising quotes
         cleaned = candidate.replace("'", '"')
         cleaned = re.sub(r"(\w+)\s*:", r'"\1":', cleaned)
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError as exc:
-            raise ValueError("Failed to parse JSON") from exc
-
-
-def parse_region_candidates(raw: str) -> List[RegionCandidate]:
-    try:
-        parsed = _load_json_lenient(raw)
-    except Exception:
-        return []
-
-    candidates: List[RegionCandidate] = []
-
-    if isinstance(parsed, dict):
-        items = parsed.get("regions") or parsed.get("bboxes") or parsed.get("boxes")
-        scores = parsed.get("scores") or parsed.get("objectness")
-        if isinstance(items, list):
-            for idx, item in enumerate(items):
-                bbox = _coerce_bbox(item)
-                score = _coerce_score(scores, idx)
-                if bbox is not None and score is not None:
-                    candidates.append(RegionCandidate(bbox=bbox, score=score))
-        else:
-            for value in parsed.values():
-                if isinstance(value, list):
-                    for item in value:
-                        bbox = _coerce_bbox(item)
-                        if bbox is not None:
-                            candidates.append(RegionCandidate(bbox=bbox, score=1.0))
-    elif isinstance(parsed, list):
-        for item in parsed:
-            bbox = None
-            score = 1.0
-            if isinstance(item, dict):
-                bbox = _coerce_bbox(item.get("bbox") or item.get("box") or item.get("b"))
-                score_val = item.get("score") or item.get("objectness")
-                if score_val is not None:
-                    score = float(score_val)
-            else:
-                bbox = _coerce_bbox(item)
-            if bbox is not None:
-                candidates.append(RegionCandidate(bbox=bbox, score=score))
-    if not candidates:
-        number_pattern = re.compile(
-            r"\[\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
-            r"\s*,\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
-            r"\s*,\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
-            r"\s*,\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
-            r"(?:\s*,\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?))?\s*\]"
-        )
-        for match in number_pattern.finditer(raw):
-            groups = match.groups()
-            if groups[0:4] and all(g is not None for g in groups[:4]):
-                x1, y1, x2, y2 = map(float, groups[:4])
-                score_group = groups[4]
-                score = float(score_group) if score_group is not None else 1.0
-                if x2 >= x1 and y2 >= y1:
-                    candidates.append(RegionCandidate(bbox=(x1, y1, x2, y2), score=score))
-    return candidates
+        return json.loads(cleaned)
 
 
 def parse_region_captions(raw: str) -> List[RegionCaption]:
@@ -457,9 +481,7 @@ def to_absolute_bbox(
     width: int,
     height: int,
 ) -> Tuple[float, float, float, float]:
-    max_val = max(width, height)
-    if max_val <= 0:
-        return bbox
+    # If coords look normalized (<=1.5 by magnitude), scale to absolute px.
     if max(abs(coord) for coord in bbox) <= 1.5:
         x1, y1, x2, y2 = bbox
         return x1 * width, y1 * height, x2 * width, y2 * height
@@ -484,30 +506,10 @@ def center_prior(
     cx, cy = bbox_center(bbox)
     img_cx, img_cy = width / 2.0, height / 2.0
     dist = math.sqrt((cx - img_cx) ** 2 + (cy - img_cy) ** 2)
-    max_dist = math.sqrt((img_cx) ** 2 + (img_cy) ** 2)
+    max_dist = math.sqrt((img_cx) ** 2 + (img_cy) ** 2)  # corner distance
     if max_dist == 0:
         return 1.0
     return max(0.0, 1.0 - min(dist / max_dist, 1.0))
-
-
-def match_caption(
-    candidate_bbox: Tuple[float, float, float, float],
-    captions: Sequence[RegionCaption],
-    width: int,
-    height: int,
-) -> str:
-    if not captions:
-        return ""
-    cand_bbox = candidate_bbox
-    best_caption = captions[0].caption if captions[0].caption else ""
-    best_iou = -1.0
-    for entry in captions:
-        abs_bbox = to_absolute_bbox(entry.bbox, width, height)
-        iou = bbox_iou(cand_bbox, abs_bbox)
-        if iou > best_iou and entry.caption:
-            best_caption = entry.caption
-            best_iou = iou
-    return best_caption
 
 
 def bbox_iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
@@ -530,26 +532,81 @@ def bbox_iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float,
     return inter_area / union
 
 
-def perform_florence(
+def match_caption(
+    candidate_bbox: Tuple[float, float, float, float],
+    captions: Sequence[RegionCaption],
+    width: int,
+    height: int,
+) -> str:
+    if not captions:
+        return ""
+    cand_bbox = candidate_bbox
+    best_caption = captions[0].caption if captions[0].caption else ""
+    best_iou = -1.0
+    for entry in captions:
+        abs_bbox = to_absolute_bbox(entry.bbox, width, height)
+        iou = bbox_iou(cand_bbox, abs_bbox)
+        if iou > best_iou and entry.caption:
+            best_caption = entry.caption
+            best_iou = iou
+    return best_caption
+
+
+def parse_florence_locs(text: str) -> List[Tuple[float, float, float, float]]:
+    """
+    Parse <loc_*> tokens produced by Florence-2 region proposal output.
+
+    Example input:
+        "</s><s><loc_0><loc_0><loc_998><loc_998></s>"
+
+    Returns list of (x1, y1, x2, y2) in [0,1] normalized coordinates.
+    """
+    tokens = re.findall(r"<loc_(\d+)>", text)
+    if len(tokens) < 4:
+        return []
+
+    coords = [int(t) / 999.0 for t in tokens]
+    boxes = []
+    for i in range(0, len(coords) - 3, 4):
+        x1, y1, x2, y2 = coords[i:i+4]
+        if 0 <= x1 <= 1 and 0 <= x2 <= 1 and 0 <= y1 <= 1 and 0 <= y2 <= 1:
+            if x2 > x1 and y2 > y1:
+                boxes.append((x1, y1, x2, y2))
+    return boxes
+
+
+_EN_STOP = {
+    "a","an","the","of","in","on","at","with","and","or","for","to","from",
+    "this","that","these","those","is","are","was","were","be","being","been",
+    "by","as","it","its","into","over","under","near","next","up","down",
+}
+
+def select_one_word(text: str) -> str:
+    """Берёт обычный caption и возвращает одно осмысленное слово.
+    Стратегия: первый токен [a-z0-9], не стоп-слово, длиной >=3."""
+    text = strip_loc_tokens(text).lower()
+    tokens = re.findall(r"[a-z0-9]+", text)
+    for t in tokens:
+        if len(t) >= 3 and t not in _EN_STOP:
+            return t
+    # запасной вариант: первый алфанум-токен, если всё остальное отпало
+    return tokens[0] if tokens else ""
+
+
+def perform_florence_main_object(
     cfg: Config,
     logger: logging.Logger,
     rel_paths: Sequence[str],
     main_objects_path: Path,
     existing: Dict[str, Any],
 ) -> Dict[str, Any]:
-    processor = AutoProcessor.from_pretrained(cfg.florence_model_id, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.florence_model_id,
-        trust_remote_code=True,
-    )
-    model.to(cfg.device)
-    model.eval()
+    fl = Florence(cfg.florence_model_id, cfg.device, cfg.florence_max_new_tokens, cfg.use_fp16, cfg.use_bf16)
 
     results = dict(existing)
     since_save = 0
     timeout = cfg.timeout_per_image_seconds
 
-    for rel_path in tqdm(rel_paths, desc="Florence", unit="img"):
+    for rel_path in tqdm(rel_paths, desc="Main object (Florence-2)", unit="img"):
         if rel_path in results:
             continue
         abs_path = cfg.image_root / rel_path
@@ -557,76 +614,70 @@ def perform_florence(
         def _process_image() -> str:
             image = open_image_rgb(abs_path)
             width, height = image.size
-            with torch.no_grad():
-                inputs = processor(
-                    text="<REGION_PROPOSAL>", images=image, return_tensors="pt"
-                ).to(cfg.device)
-                with torch_autocast(cfg.device, cfg.use_fp16, cfg.use_bf16):
-                    proposal_ids = model.generate(
-                        **inputs,
-                        max_new_tokens=cfg.florence_max_new_tokens,
-                    )
-                proposal_text = processor.batch_decode(
-                    proposal_ids, skip_special_tokens=False
-                )[0]
-                proposal_text = proposal_text.replace("<REGION_PROPOSAL>", "").strip()
 
-                dense_inputs = processor(
-                    text="<DENSE_REGION_CAPTION>", images=image, return_tensors="pt"
-                ).to(cfg.device)
-                with torch_autocast(cfg.device, cfg.use_fp16, cfg.use_bf16):
-                    dense_ids = model.generate(
-                        **dense_inputs,
-                        max_new_tokens=cfg.florence_max_new_tokens,
-                    )
-                dense_text = processor.batch_decode(dense_ids, skip_special_tokens=False)[0]
-                dense_text = dense_text.replace("<DENSE_REGION_CAPTION>", "").strip()
+            # 1) Proposals
+            proposal_text = fl.generate(image, "<REGION_PROPOSAL>")
+            loc_boxes = parse_florence_locs(proposal_text)
+            candidates = [RegionCandidate(bbox=b, score=1.0) for b in loc_boxes]
 
-            candidates = parse_region_candidates(proposal_text)
-            if not candidates:
-                return ""
-            captions = parse_region_captions(dense_text)
+            # 2) Dense captions (for label assignment)
+            dense_text = fl.generate(image, "<DENSE_REGION_CAPTION>")
+            # 1) пробуем структурно распарсить caption+4loc
+            captions = parse_florence_dense_pairs(dense_text)
+            # 2) если не получилось, берём глобальный капшен без loc-токенов
             if not captions and dense_text.strip():
-                captions = [
-                    RegionCaption(
+                global_caption = strip_loc_tokens(dense_text)
+                if global_caption:
+                    captions = [RegionCaption(
                         bbox=(0.0, 0.0, float(width), float(height)),
-                        caption=dense_text.strip(),
-                    )
-                ]
+                        caption=global_caption,
+                    )]
 
+            # 3) Score candidates with area_norm * center_prior * objectness
             best_caption = ""
-            best_score = -1.0
-            for candidate in candidates:
-                abs_bbox = to_absolute_bbox(candidate.bbox, width, height)
-                area = bbox_area(abs_bbox)
-                if area <= 0:
-                    continue
-                prior = center_prior(abs_bbox, width, height)
-                score = candidate.score * area * prior
-                if score > best_score:
-                    best_score = score
-                    best_caption = match_caption(abs_bbox, captions, width, height)
+            if candidates:
+                img_area = float(width * height) if width > 0 and height > 0 else 1.0
+                best_score = -1.0
+                for cand in candidates:
+                    abs_bbox = to_absolute_bbox(cand.bbox, width, height)
+                    area = bbox_area(abs_bbox)
+                    if area <= 0:
+                        continue
+                    area_norm = max(0.0, min(area / img_area, 1.0))
+                    prior = center_prior(abs_bbox, width, height)
+                    final_score = (cand.score or 1.0) * area_norm * prior
+                    if final_score > best_score:
+                        best_score = final_score
+                        best_caption = match_caption(abs_bbox, captions, width, height)
+
+            # 4) If still empty -> ask for one-word caption
+            if not best_caption:
+                caption_full = fl.generate(image, "<CAPTION>")
+                best_caption = select_one_word(caption_full)
+
             return best_caption
 
         try:
             caption = run_with_timeout(_process_image, timeout)
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception as exc:  # noqa: BLE001
             log_exception(logger, rel_path, exc)
             caption = ""
 
-        results[rel_path] = caption or ""
+        results[rel_path] = strip_loc_tokens(caption or "")
         since_save += 1
         if since_save >= cfg.save_every:
             save_json(main_objects_path, results)
             since_save = 0
 
     save_json(main_objects_path, results)
-    del model
-    del processor
+    fl.close()
     cleanup_torch(cfg.device)
     return results
 
 
+# -----------------------------
+# CLIP (unchanged)
+# -----------------------------
 def preprocess_clip_text(
     processor: CLIPProcessor,
     styles: Sequence[str],
@@ -708,7 +759,8 @@ def perform_clip(
                 with torch_autocast(cfg.device, cfg.use_fp16, cfg.use_bf16):
                     image_features = model.get_image_features(**image_inputs)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            logits = image_features @ style_embeddings.T
+            se = style_embeddings.to(device=image_features.device, dtype=image_features.dtype)
+            logits = image_features @ se.T
             probs = torch.softmax(logits, dim=-1)
             results_local: List[Tuple[str, float]] = []
             for prob in probs:
@@ -718,17 +770,14 @@ def perform_clip(
 
         try:
             batch_results = run_with_timeout(_process_batch, timeout)
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception as exc:  # noqa: BLE001
             for rel_path in rels:
                 log_exception(logger, rel_path, exc)
             batch.clear()
             return
 
         for rel_path, (style, confidence) in zip(rels, batch_results):
-            if confidence < cfg.clip_threshold:
-                predicted = "unknown"
-            else:
-                predicted = style
+            predicted = style if confidence >= cfg.clip_threshold else "unknown"
             results[rel_path] = predicted
             since_save += 1
             if since_save >= cfg.save_every:
@@ -754,8 +803,8 @@ def perform_clip(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate dataset annotations")
-    parser.add_argument("--config", required=True, type=Path, help="Path to YAML config")
-    parser.add_argument("--device", choices=["cpu", "cuda"], help="Override device", default=None)
+    parser.add_argument("--config", default="qwen-vl-finetune/qwenvl/generate_annotation.yaml", type=Path, help="Path to YAML config")
+    parser.add_argument("--device", choices=["cpu", "cuda"], help="Override device", default="cuda")
     args = parser.parse_args()
 
     cfg = load_config(args.config, args.device)
@@ -776,8 +825,8 @@ def main() -> None:
     styles = load_json(styles_path)
 
     if image_paths:
-        texts = perform_ocr(cfg, logger, image_paths, texts_path, texts)
-        main_objects = perform_florence(cfg, logger, image_paths, main_objects_path, main_objects)
+        texts = perform_ocr_florence(cfg, logger, image_paths, texts_path, texts)
+        main_objects = perform_florence_main_object(cfg, logger, image_paths, main_objects_path, main_objects)
         styles = perform_clip(cfg, logger, image_paths, styles_path, styles)
     else:
         logger.info("No images found; exiting.")

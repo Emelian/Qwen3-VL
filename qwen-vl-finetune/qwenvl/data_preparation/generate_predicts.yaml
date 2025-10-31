@@ -1,0 +1,27 @@
+image_root: "/mnt/storage/Downloads/WatermarkDataset/sample images 100"
+output_path: "/mnt/storage/Downloads/WatermarkDataset/images/sample images 100.json"
+device: null
+save_every: 10
+max_new_tokens: 512
+skip_existing: true
+styles:
+  - photo
+  - screenshot
+  - portrait
+  - landscape
+  - clipart
+  - comic
+  - anime
+  - render
+  - concept
+  - illustration
+  - minimalist
+  - vintage
+  - poster
+  - meme
+  - infographic
+  - sketch
+  - watercolor
+  - digital
+  - fashion
+  - documentary

@@ -1,0 +1,34 @@
+image_root: "/mnt/storage/Downloads/WatermarkDataset/sample images 100"
+output_dir: "/mnt/storage/Downloads/WatermarkDataset/sample images 100/annotations"
+batch_size_clip: 8
+save_every: 10
+device: cuda
+ocr_model_id: microsoft/trocr-large-printed
+florence_model_id: microsoft/Florence-2-base
+clip_model_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+clip_styles:
+  - photo
+  - screenshot
+  - portrait
+  - landscape
+  - clipart
+  - comic
+  - anime
+  - render
+  - concept
+  - illustration
+  - minimalist
+  - vintage
+  - poster
+  - meme
+  - infographic
+  - sketch
+  - watercolor
+  - digital
+  - fashion
+  - documentary
+clip_threshold: 0.05
+florence_max_new_tokens: 512
+use_bf16: false
+use_fp16: true
+timeout_per_image_seconds: 60
