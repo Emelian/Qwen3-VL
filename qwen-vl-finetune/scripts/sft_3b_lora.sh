@@ -13,7 +13,7 @@ deepspeed=./qwen-vl-finetune/scripts/zero2.json
 llm=Qwen/Qwen2.5-VL-3B-Instruct  # Using HuggingFace model ID
 
 # Training hyperparameters
-lr=1e-4
+lr=2e-7
 batch_size=4
 grad_accum_steps=4
 
@@ -48,6 +48,7 @@ args="
     --save_steps 500 \
     --save_total_limit 3 \
     --learning_rate ${lr} \
+    --mm_projector_lr 1e-5 \
     --weight_decay 0.01 \
     --warmup_ratio 0.03 \
     --max_grad_norm 1 \
