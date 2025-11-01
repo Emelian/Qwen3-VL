@@ -7,13 +7,13 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 NNODES=${WORLD_SIZE:-1}
 
 # DeepSpeed configuration
-deepspeed=./qwen-vl-finetune/scripts/zero3.json
+deepspeed=./qwen-vl-finetune/scripts/zero2.json
 
 # Model configuration
 llm=Qwen/Qwen2.5-VL-3B-Instruct  # Using HuggingFace model ID
 
 # Training hyperparameters
-lr=2e-6
+lr=1e-5
 batch_size=4
 grad_accum_steps=4
 
@@ -37,7 +37,7 @@ args="
     --tune_mm_llm True \
     --bf16 \
     --output_dir ${output_dir} \
-    --num_train_epochs 3 \
+    --num_train_epochs 12 \
     --per_device_train_batch_size ${batch_size} \
     --per_device_eval_batch_size $((batch_size*2)) \
     --gradient_accumulation_steps ${grad_accum_steps} \
@@ -45,12 +45,12 @@ args="
     --min_pixels 784 \
     --eval_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 505 \
-    --save_total_limit 3 \
+    --save_steps 501 \
+    --save_total_limit 5 \
     --learning_rate ${lr} \
-    --mm_projector_lr 1e-5 \
+    --mm_projector_lr 5e-5 \
     --weight_decay 0.01 \
-    --warmup_ratio 0.03 \
+    --warmup_ratio 0.05 \
     --max_grad_norm 1 \
     --lr_scheduler_type "cosine" \
     --logging_steps 10 \
@@ -61,7 +61,7 @@ args="
     --lora_enable True \
     --lora_r 8 \
     --lora_alpha 16 \
-    --lora_dropout 0.0"
+    --lora_dropout 0.05"
     # --data_flatten True \
 
 export HF_USE_FLASH_ATTENTION_2=0
