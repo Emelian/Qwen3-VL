@@ -8,7 +8,7 @@ Output JSON (<root>/predictions.json) is a list like:
   {
     "image": "relative/path/to/img.jpg",
     "conversations": [
-      {"from": "human", "value": "<image>"},
+      {"from": "human", "value": "<image>\\nAnalyze...STRICT JSON..."},
       {"from": "gpt",   "value": "{\"watermarks\": 2, \"text\": [], \"main object\": \"logo\", \"style\": \"photo\"}"}
     ]
   },
@@ -30,6 +30,18 @@ from tqdm.auto import tqdm
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
+
+ONE_PROMPT = (
+    "<image>\n"
+    "Analyze the image and return STRICT JSON with EXACTLY these keys and types:\n"
+    "{\n"
+    '  \"watermarks\": <integer>,\n'
+    '  \"text\": <array of strings>,\n'
+    '  \"main object\": <string>,\n'
+    '  \"style\": <string>\n'
+    "}\n"
+    "Do not add any extra text or explanation."
+)
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -151,7 +163,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     for rel in tqdm(rel_images, desc="Predicting", unit="img"):
         try:
             img = open_image_rgb(root / rel)
-            raw_output = predictor.run_prompt(img, "<image>")
+            raw_output = predictor.run_prompt(img, ONE_PROMPT)
         except Exception as e:  # noqa: BLE001
             log_error(root, rel, e)
             raw_output = ""
@@ -159,7 +171,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         item = {
             "image": rel,
             "conversations": [
-                {"from": "human", "value": "<image>"},
+                {"from": "human", "value": ONE_PROMPT},
                 {"from": "gpt", "value": raw_output},
             ],
         }
